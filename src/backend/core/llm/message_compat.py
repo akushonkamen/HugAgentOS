@@ -8,8 +8,6 @@ from typing import Any, Dict, List
 from core.llm.context_adapter import AgentScopeContextAdapter
 
 
-
-
 def dict_to_msg(d: Dict[str, Any], *, created_seq: int = 0) -> Any:
     """Convert a dict message (OpenAI format) to an AgentScope Msg.
 
@@ -46,6 +44,56 @@ def dict_to_msg(d: Dict[str, Any], *, created_seq: int = 0) -> Any:
     )
 
 
+def _dedupe_tool_blocks(session_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop duplicate tool_call blocks from replayed history, with their results.
+
+    Persisted logs written before plan steps stopped re-collecting the replayed
+    history (issue #140) can carry the same tool-use id — and its result —
+    several times. Bedrock-backed upstreams reject the whole request when an id
+    repeats or when a result's call is missing, so replay dedupes defensively:
+    the first occurrence of a call wins, a result is kept only while the call
+    it answers survived and has not been answered yet, and a row left without
+    any block disappears. Inputs are never mutated; rows without block lists
+    pass through untouched.
+    """
+    out: List[Dict[str, Any]] = []
+    seen_calls: set = set()
+    seen_results: set = set()
+    for row in session_messages:
+        content = row.get("content")
+        if not isinstance(content, list):
+            out.append(row)
+            continue
+        blocks: List[Any] = []
+        dropped = False
+        for block in content:
+            if not isinstance(block, dict):
+                blocks.append(block)
+                continue
+            block_type = block.get("type")
+            if block_type not in ("tool_call", "tool_result"):
+                blocks.append(block)
+                continue
+            block_id = str(block.get("id") or "")
+            if block_type == "tool_call":
+                if block_id and block_id in seen_calls:
+                    dropped = True
+                    continue
+                if block_id:
+                    seen_calls.add(block_id)
+            else:  # tool_result
+                if block_id and (block_id not in seen_calls or block_id in seen_results):
+                    dropped = True
+                    continue
+                if block_id:
+                    seen_results.add(block_id)
+            blocks.append(block)
+        if dropped:
+            if not blocks:
+                continue
+            row = {**row, "content": blocks}
+        out.append(row)
+    return out
 
 
 def session_to_msgs(session_messages: List[Dict[str, Any]]) -> List[Any]:
@@ -60,12 +108,16 @@ def session_to_msgs(session_messages: List[Dict[str, Any]]) -> List[Any]:
     upstream — replay, the compaction checkpoint, the run's recovery snapshot —
     carries the sha256 only, because none of them needs the pixels and all of
     them get JSON-serialized; this is the first point where something does.
+
+    Duplicate tool-use ids are collapsed here (first occurrence wins, results
+    follow their call) so a history poisoned by the old plan collector cannot
+    replay as a provider-invalid request — see :func:`_dedupe_tool_blocks`.
     """
     from core.llm.tool_media_store import hydrate_rows
 
     return [
         dict_to_msg(message, created_seq=index)
-        for index, message in enumerate(hydrate_rows(session_messages))
+        for index, message in enumerate(_dedupe_tool_blocks(hydrate_rows(session_messages)))
         if message.get("content")
     ]
 

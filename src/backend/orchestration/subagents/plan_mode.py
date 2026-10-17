@@ -5,7 +5,6 @@ Phase 2 (execute):  Steps are executed sequentially, each with its own agent.
 """
 
 from __future__ import annotations
-from core.infra.time import utc_now
 
 import asyncio
 import json
@@ -20,7 +19,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from core.config.settings import DEFAULT_CHAT_MODEL_ALIAS
 from core.db.models import Plan
 from core.infra.logging import LogContext
-from core.llm.factory import create_agent_executor
+from core.infra.time import utc_now
 from core.llm.context_adapter import append_context_text, next_request_sequence, render_context_item
 from core.llm.context_ir import (
     KIND_ATTACHMENT,
@@ -32,6 +31,7 @@ from core.llm.context_ir import (
     make_text_context_item,
     session_context_metadata,
 )
+from core.llm.factory import create_agent_executor
 from core.llm.mcp_manager import close_clients
 from core.services import log_service as log_writer
 from core.services.plan_service import PlanService
@@ -608,6 +608,179 @@ def _parse_plan_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _current_step_segment(
+    context: List[Any],
+    *,
+    pre_reply_context: List[Any],
+    pre_reply_len: int,
+    pre_reply_call_ids: set,
+) -> List[Any]:
+    """The messages this step's own reply produced — never the replayed history.
+
+    Issue #140: extraction used to scan the whole context, so the replayed
+    history's tool calls were re-collected on every step and appended (same
+    tool-use id, one more copy each time) into the persisted message — which
+    Bedrock-backed upstreams reject wholesale with 400 REQUEST_BODY_INVALID.
+    The primary path slices by the pre-reply baseline; when mid-turn
+    compaction replaced the list (``CompactingAgent.compress_context`` rebinds
+    ``state.context`` to a fresh list), fall back to dropping every message
+    whose tool calls all predate the step.
+    """
+    if context is pre_reply_context:
+        return list(context)[pre_reply_len:]
+    return [
+        msg
+        for msg in context
+        if not (
+            hasattr(msg, "has_content_blocks")
+            and msg.has_content_blocks("tool_call")
+            and all(
+                str(getattr(block, "id", "") or "") in pre_reply_call_ids
+                for block in msg.get_content_blocks("tool_call")
+            )
+        )
+    ]
+
+
+def _collect_step_tool_activity(
+    segment: List[Any],
+    *,
+    step_id: str,
+    user_id: Optional[str],
+    chat_id: Optional[str],
+    subagent_log_id: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Extract tool calls/results from one step's own context segment.
+
+    Returns ``(step_tool_calls, sse_events, tool_log_writes)``: the entries for
+    the step's ``tool_calls_log``, the ``tool_call`` / ``tool_result`` SSE
+    events in block order, and the tool-call audit writes to schedule. Pure —
+    no I/O — so the collection rules stay unit-testable.
+    """
+    step_tool_calls: List[Dict[str, Any]] = []
+    sse_events: List[Dict[str, Any]] = []
+    tool_log_writes: List[Dict[str, Any]] = []
+    pending: Dict[str, Dict[str, Any]] = {}
+
+    for mem_msg in segment:
+        if hasattr(mem_msg, "has_content_blocks") and mem_msg.has_content_blocks("tool_call"):
+            for block in mem_msg.get_content_blocks("tool_call"):
+                tool_name = getattr(block, "name", "unknown")
+                tool_id = getattr(block, "id", "")
+                _raw_input = getattr(block, "input", "") or ""
+                try:
+                    tool_args = (
+                        json.loads(_raw_input) if isinstance(_raw_input, str) else _raw_input
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    tool_args = {"_raw": _raw_input}
+                # 2.0: block is a ToolCallBlock pydantic object, not JSON-serializable;
+                # tool_calls_log is JSONB → must store a serializable dict (in 1.x it already was a dict).
+                step_tool_calls.append(
+                    {"tool_name": tool_name, "tool_id": tool_id, "tool_args": tool_args}
+                )
+                pending[tool_id] = {
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                }
+                sse_events.append(
+                    {
+                        "type": "tool_call",
+                        "step_id": step_id,
+                        "tool_name": tool_name,
+                        "tool_id": tool_id,
+                        "tool_args": tool_args,
+                    }
+                )
+        if hasattr(mem_msg, "has_content_blocks") and mem_msg.has_content_blocks("tool_result"):
+            for block in mem_msg.get_content_blocks("tool_result"):
+                tool_name = getattr(block, "name", "unknown")
+                tool_id = getattr(block, "id", "")
+                output = getattr(block, "output", []) or []
+                # Try to extract structured content; fall back to text
+                content: Any = output
+                if isinstance(output, list):
+                    # Single text block → string; otherwise keep as-is
+                    text_parts = []
+                    has_only_text = True
+                    for item in output:
+                        if isinstance(item, dict):
+                            text_val = item.get("text")
+                            if text_val is not None:
+                                text_parts.append(str(text_val))
+                            else:
+                                has_only_text = False
+                                break
+                        elif isinstance(item, str):
+                            text_parts.append(item)
+                        elif getattr(item, "type", None) == "text":
+                            text_parts.append(getattr(item, "text", ""))
+                        else:
+                            has_only_text = False
+                            break
+                    if has_only_text and text_parts:
+                        # Try parsing as JSON for structured output
+                        joined = "\n".join(text_parts)
+                        try:
+                            content = json.loads(joined)
+                        except (json.JSONDecodeError, ValueError):
+                            content = joined
+                    # else: keep content = output (list)
+                elif isinstance(output, str):
+                    try:
+                        content = json.loads(output)
+                    except (json.JSONDecodeError, ValueError):
+                        content = output
+                _call = pending.pop(tool_id, {})
+                tool_log_writes.append(
+                    {
+                        # user_id/chat_id passed explicitly: plan execution runs in a
+                        # subtask context where contextvars are unreliable (same fix
+                        # as the streaming main path).
+                        "user_id": user_id or None,
+                        "chat_id": chat_id or None,
+                        "tool_name": _call.get("tool_name") or tool_name,
+                        "tool_call_id": tool_id,
+                        "tool_args": _call.get("tool_args"),
+                        "tool_result": content,
+                        "status": "success",
+                        "source": "subagent",
+                        "subagent_log_id": subagent_log_id,
+                    }
+                )
+                # Backfill the result into the matching tool_call entry (for tool_calls_log persistence)
+                for _e in step_tool_calls:
+                    if _e.get("tool_id") == tool_id and "result" not in _e:
+                        _e["result"] = content
+                        _e["status"] = "success"
+                        break
+                sse_events.append(
+                    {
+                        "type": "tool_result",
+                        "step_id": step_id,
+                        "tool_name": tool_name,
+                        "tool_id": tool_id,
+                        "result": content,
+                    }
+                )
+    # Any tool_call without a paired tool_result (interrupted mid-call)
+    for _tid, _rec in pending.items():
+        tool_log_writes.append(
+            {
+                "user_id": user_id or None,
+                "chat_id": chat_id or None,
+                "tool_name": _rec.get("tool_name", "unknown"),
+                "tool_call_id": _tid,
+                "tool_args": _rec.get("tool_args"),
+                "status": "failed",
+                "error_message": "no tool_result received",
+                "source": "subagent",
+                "subagent_log_id": subagent_log_id,
+            }
+        )
+    return step_tool_calls, sse_events, tool_log_writes
+
+
 async def astream_execute_plan(
     plan_id: str,
     user_id: str,
@@ -891,6 +1064,21 @@ async def astream_execute_plan(
                         token_budget=8_000,
                     )
 
+                # Everything the context holds before the step's reply is replayed
+                # history / attachments. Its tool calls must never re-enter this
+                # step's log: re-collecting them used to append one duplicate
+                # tool-use id per step into the persisted message, which
+                # Bedrock-backed upstreams reject with 400 REQUEST_BODY_INVALID
+                # (issue #140). _current_step_segment applies this baseline.
+                pre_reply_context = agent.state.context
+                pre_reply_len = len(pre_reply_context)
+                pre_reply_call_ids = {
+                    str(getattr(block, "id", "") or "")
+                    for msg in pre_reply_context
+                    if hasattr(msg, "has_content_blocks") and msg.has_content_blocks("tool_call")
+                    for block in msg.get_content_blocks("tool_call")
+                }
+
                 step_seq = next_request_sequence(agent.state.context)
                 user_msg = render_context_item(
                     make_text_context_item(
@@ -966,140 +1154,38 @@ async def astream_execute_plan(
                     reply = reply_task.result()
 
                     # ── Extract tool calls from agent memory ──
-                    _pending_log: Dict[str, Dict[str, Any]] = {}
+                    # AgentScope 2.0: agent.memory → agent.state.context;
+                    # tool_use → tool_call; content blocks are pydantic objects (attribute access).
+                    # Only the segment this step's reply produced is scanned — the
+                    # replayed history's calls must not be re-collected (#140).
                     try:
-                        # AgentScope 2.0: agent.memory → agent.state.context;
-                        # tool_use → tool_call; content blocks are pydantic objects (attribute access).
-                        mem_msgs = list(agent.state.context)
-                        for mem_msg in mem_msgs or []:
-                            if hasattr(
-                                mem_msg, "has_content_blocks"
-                            ) and mem_msg.has_content_blocks("tool_call"):
-                                for block in mem_msg.get_content_blocks("tool_call"):
-                                    tool_name = getattr(block, "name", "unknown")
-                                    tool_id = getattr(block, "id", "")
-                                    _raw_input = getattr(block, "input", "") or ""
-                                    try:
-                                        tool_args = (
-                                            json.loads(_raw_input)
-                                            if isinstance(_raw_input, str)
-                                            else _raw_input
-                                        )
-                                    except (json.JSONDecodeError, ValueError):
-                                        tool_args = {"_raw": _raw_input}
-                                    # 2.0: block is a ToolCallBlock pydantic object, not JSON-serializable;
-                                    # tool_calls_log is JSONB → must store a serializable dict (in 1.x it already was a dict).
-                                    step_tool_calls.append(
-                                        {
-                                            "tool_name": tool_name,
-                                            "tool_id": tool_id,
-                                            "tool_args": tool_args,
-                                        }
-                                    )
-                                    _pending_log[tool_id] = {
-                                        "tool_name": tool_name,
-                                        "tool_args": tool_args,
-                                    }
-                                    yield {
-                                        "type": "tool_call",
-                                        "step_id": step.step_id,
-                                        "tool_name": tool_name,
-                                        "tool_id": tool_id,
-                                        "tool_args": tool_args,
-                                    }
-                            if hasattr(
-                                mem_msg, "has_content_blocks"
-                            ) and mem_msg.has_content_blocks("tool_result"):
-                                for block in mem_msg.get_content_blocks("tool_result"):
-                                    tool_name = getattr(block, "name", "unknown")
-                                    tool_id = getattr(block, "id", "")
-                                    output = getattr(block, "output", []) or []
-                                    # Try to extract structured content; fall back to text
-                                    content: Any = output
-                                    if isinstance(output, list):
-                                        # Single text block → string; otherwise keep as-is
-                                        text_parts = []
-                                        has_only_text = True
-                                        for item in output:
-                                            if isinstance(item, dict):
-                                                text_val = item.get("text")
-                                                if text_val is not None:
-                                                    text_parts.append(str(text_val))
-                                                else:
-                                                    has_only_text = False
-                                                    break
-                                            elif isinstance(item, str):
-                                                text_parts.append(item)
-                                            elif getattr(item, "type", None) == "text":
-                                                text_parts.append(getattr(item, "text", ""))
-                                            else:
-                                                has_only_text = False
-                                                break
-                                        if has_only_text and text_parts:
-                                            # Try parsing as JSON for structured output
-                                            joined = "\n".join(text_parts)
-                                            try:
-                                                content = json.loads(joined)
-                                            except (json.JSONDecodeError, ValueError):
-                                                content = joined
-                                        # else: keep content = output (list)
-                                    elif isinstance(output, str):
-                                        try:
-                                            content = json.loads(output)
-                                        except (json.JSONDecodeError, ValueError):
-                                            content = output
-                                    try:
-                                        _call = _pending_log.pop(tool_id, {})
-                                        log_writer.schedule_tool_call_write(
-                                            {
-                                                # Pass user_id/chat_id explicitly: plan execution runs in a subtask
-                                                # context where contextvars are unreliable (same fix as the streaming main path).
-                                                "user_id": user_id or None,
-                                                "chat_id": chat_id or None,
-                                                "tool_name": _call.get("tool_name") or tool_name,
-                                                "tool_call_id": tool_id,
-                                                "tool_args": _call.get("tool_args"),
-                                                "tool_result": content,
-                                                "status": "success",
-                                                "source": "subagent",
-                                                "subagent_log_id": _step_subagent_log_id,
-                                            }
-                                        )
-                                    except Exception:
-                                        logger.debug("plan tool log failed", exc_info=True)
-                                    # Backfill the result into the matching tool_call entry (for tool_calls_log persistence)
-                                    for _e in step_tool_calls:
-                                        if _e.get("tool_id") == tool_id and "result" not in _e:
-                                            _e["result"] = content
-                                            _e["status"] = "success"
-                                            break
-                                    yield {
-                                        "type": "tool_result",
-                                        "step_id": step.step_id,
-                                        "tool_name": tool_name,
-                                        "tool_id": tool_id,
-                                        "result": content,
-                                    }
+                        segment = _current_step_segment(
+                            agent.state.context,
+                            pre_reply_context=pre_reply_context,
+                            pre_reply_len=pre_reply_len,
+                            pre_reply_call_ids=pre_reply_call_ids,
+                        )
+                        step_tool_calls, step_tool_events, step_tool_writes = (
+                            _collect_step_tool_activity(
+                                segment,
+                                step_id=step.step_id,
+                                user_id=user_id,
+                                chat_id=chat_id,
+                                subagent_log_id=_step_subagent_log_id,
+                            )
+                        )
                     except Exception as _mem_exc:
                         logger.warning(
                             "[plan-exec] Failed to extract tool calls from memory: %s", _mem_exc
                         )
-                    # Any tool_use without a paired tool_result (interrupted mid-call)
-                    for _tid, _rec in list(_pending_log.items()):
-                        log_writer.schedule_tool_call_write(
-                            {
-                                "user_id": user_id or None,
-                                "chat_id": chat_id or None,
-                                "tool_name": _rec.get("tool_name", "unknown"),
-                                "tool_call_id": _tid,
-                                "tool_args": _rec.get("tool_args"),
-                                "status": "failed",
-                                "error_message": "no tool_result received",
-                                "source": "subagent",
-                                "subagent_log_id": _step_subagent_log_id,
-                            }
-                        )
-                    _pending_log.clear()
+                    else:
+                        for _write in step_tool_writes:
+                            try:
+                                log_writer.schedule_tool_call_write(_write)
+                            except Exception:
+                                logger.debug("plan tool log failed", exc_info=True)
+                        for _evt in step_tool_events:
+                            yield _evt
 
                     # Extract text from reply
                     if hasattr(reply, "content"):
